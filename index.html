@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Overlay Projector — wall.glb</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; }
+  #c { display: block; width: 100%; height: 100%; }
+  #hud {
+    position: fixed; left: 12px; bottom: 12px; z-index: 10;
+    font: 12px/1.5 system-ui, sans-serif; color: #ccc;
+    background: rgba(0,0,0,.45); padding: 8px 10px; border-radius: 6px;
+    pointer-events: none; white-space: pre;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading…</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "lil-gui": "https://unpkg.com/lil-gui@0.19.2/dist/lil-gui.esm.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import GUI from 'lil-gui';
+
+// ============================== SCENE ==============================
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.VSMShadowMap; // honors shadow.radius for adjustable soft shadows
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202327);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 1000);
+camera.position.set(3, 2, 4);
+
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.target.set(0, 0, 0);
+
+// Image-based lighting for correct PBR (no external HDR file).
+// PMREM is kept alive for the app lifetime so HDRIs can be converted on demand.
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const dir = new THREE.DirectionalLight(0xffffff, 2.0);
+dir.position.set(5, 8, 5);
+dir.castShadow = true;
+dir.shadow.mapSize.set(4096, 4096);
+dir.shadow.normalBias = 0.02;
+dir.shadow.bias = -0.0005;
+dir.shadow.radius = 12;         // VSM blur radius — driven by the Shadow softness slider
+dir.shadow.blurSamples = 25;   // VSM gaussian samples
+scene.add(dir);
+scene.add(dir.target);
+scene.add(new THREE.AmbientLight(0xffffff, 0.15));
+
+// Sun (directional light) state. Seeded to match the previous (5,8,5) default.
+const sceneCenter = new THREE.Vector3(0, 0, 0);
+const sunState = { azimuthDeg: 45, elevationDeg: 48, intensity: 2.0, color: [255, 255, 255], auto: true };
+
+function applySun() {
+  const a = THREE.MathUtils.degToRad(sunState.azimuthDeg);
+  const e = THREE.MathUtils.degToRad(sunState.elevationDeg);
+  const dirVec = new THREE.Vector3(Math.cos(e) * Math.cos(a), Math.sin(e), Math.cos(e) * Math.sin(a));
+  dir.position.copy(sceneCenter).addScaledVector(dirVec, 20);
+  dir.target.position.copy(sceneCenter);
+  dir.target.updateMatrixWorld();
+  dir.intensity = sunState.intensity;
+  dir.color.setRGB(sunState.color[0] / 255, sunState.color[1] / 255, sunState.color[2] / 255);
+}
+applySun();
+
+// Transparent shadow-catcher ground; only the shadow renders, HDRI/bg shows through.
+const groundMat = new THREE.ShadowMaterial({ transparent: true, opacity: 0.3 });
+let shadowStrengthBase = 0.3; // base shadow opacity from the Shadow strength slider
+// Shadow fades with sun intensity (full at intensity >= 2, none at 0).
+function updateShadowOpacity() {
+  groundMat.opacity = shadowStrengthBase * THREE.MathUtils.clamp(sunState.intensity / 2, 0, 1);
+}
+updateShadowOpacity();
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+ground.visible = false; // shown + sized once the wall bbox is known
+scene.add(ground);
+
+let wallRoot = null;           // gltf.scene
+const meshMaterials = [];      // every mesh material, for patching later
+
+const loader = new GLTFLoader();
+loader.load(
+  'wall.glb',
+  (gltf) => {
+    wallRoot = gltf.scene;
+    scene.add(wallRoot);
+    wallRoot.traverse((o) => {
+      if (o.isMesh && o.material) {
+        meshMaterials.push(o.material);
+        o.castShadow = true;
+        o.receiveShadow = true;
+      }
+    });
+    frameCameraOnObject(wallRoot);
+    setupGroundAndShadow(wallRoot);
+    meshMaterials.forEach(patchMaterial);
+    updateProjector();
+    hud.textContent = `loaded wall.glb — ${meshMaterials.length} material(s)`;
+  },
+  undefined,
+  (err) => { hud.textContent = 'GLB load error (see console)'; console.error(err); }
+);
+
+function frameCameraOnObject(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.5 || 1;
+  orbit.target.copy(center);
+  camera.position.copy(center).add(new THREE.Vector3(radius * 2.2, radius * 1.6, radius * 2.6));
+  camera.near = radius / 100;
+  camera.far = radius * 100;
+  camera.updateProjectionMatrix();
+  orbit.update();
+}
+
+function setupGroundAndShadow(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.5 || 1;
+
+  // Ground at the bottom of the mesh, large enough to catch the shadow.
+  ground.scale.set(radius * 20, radius * 20, 1);
+  ground.position.set(center.x, box.min.y, center.z);
+  ground.visible = true;
+
+  // Fit the directional light's orthographic shadow camera to the mesh.
+  const cam = dir.shadow.camera;
+  cam.left = -radius * 2; cam.right = radius * 2;
+  cam.top = radius * 2;   cam.bottom = -radius * 2;
+  cam.near = 0.01;        cam.far = radius * 40;
+  cam.updateProjectionMatrix();
+  dir.target.position.copy(center);
+  scene.add(dir.target);
+  sceneCenter.copy(center);
+  applySun(); // reposition the sun relative to the loaded mesh
+}
+
+// ============================== PROJECTOR ==============================
+function patchMaterial(material) {
+  if (!material || material.userData.__projPatched) return;
+  material.userData.__projPatched = true;
+
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, layerUniforms);
+
+    // --- vertex: expose world position + world normal ---
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>',
+        `#include <common>
+         varying vec3 vWorldPos;
+         varying vec3 vWorldNrm;`)
+      .replace('#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+         vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+         vWorldNrm = mat3(modelMatrix) * objectNormal;`);
+
+    // --- fragment: declarations ---
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>',
+        `#include <common>
+         varying vec3 vWorldPos;
+         varying vec3 vWorldNrm;
+         uniform sampler2D uLayerTex[4];
+         uniform int   uLayerEnabled[4];
+         uniform int   uLayerHasTex[4];
+         uniform mat4  uLayerProjInv[4];
+         uniform int   uLayerBlend[4];
+         uniform float uLayerOpacity[4];
+         uniform float uLayerRough[4];
+         uniform float uLayerPersp[4];
+         uniform int   uLayerCull[4];
+         uniform float uLayerBrightness[4];
+         uniform float uLayerContrast[4];
+         uniform float uLayerSaturation[4];
+         uniform vec3  uLayerTint[4];
+         float gRough;
+         // Index the sampler array with CONSTANT indices only (ANGLE/D3D forbids
+         // indexing a sampler array with a non-constant loop variable).
+         vec4 sampleLayerTex(int idx, vec2 uv) {
+           if (idx == 0) return texture2D(uLayerTex[0], uv);
+           else if (idx == 1) return texture2D(uLayerTex[1], uv);
+           else if (idx == 2) return texture2D(uLayerTex[2], uv);
+           return texture2D(uLayerTex[3], uv);
+         }`)
+      // inject AFTER albedo is in diffuseColor
+      .replace('#include <map_fragment>',
+        `#include <map_fragment>
+         gRough = 0.0;
+         for (int i = 0; i < 4; i++) {
+           if (uLayerEnabled[i] == 0 || uLayerHasTex[i] == 0) continue;
+           vec3 lp = (uLayerProjInv[i] * vec4(vWorldPos, 1.0)).xyz;
+           float depth = lp.z * 0.5 + 0.5;
+           float pscale = mix(1.0, max(depth, 0.0001), uLayerPersp[i]);
+           vec2 puv = lp.xy / pscale;
+           bool inside = all(lessThan(abs(vec3(puv, lp.z)), vec3(1.0)));
+           float facing = dot(normalize(vWorldNrm),
+                              normalize(mat3(uLayerProjInv[i]) * vec3(0.0, 0.0, 1.0)));
+           if (uLayerCull[i] == 1 && facing < 0.0) inside = false;
+           if (!inside) continue;
+           vec2 ouv = puv * 0.5 + 0.5;
+           vec4 ov = sampleLayerTex(i, ouv);
+           vec3 col = ov.rgb * uLayerBrightness[i];
+           col = (col - 0.5) * uLayerContrast[i] + 0.5;
+           float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+           col = mix(vec3(lum), col, uLayerSaturation[i]);
+           col *= uLayerTint[i];
+           col = max(col, 0.0);
+           float a = ov.a * uLayerOpacity[i];
+           vec3 base = diffuseColor.rgb;
+           vec3 res = base;
+           if (uLayerBlend[i] == 0)      res = mix(base, col, a);
+           else if (uLayerBlend[i] == 1) res = mix(base, base * col, a);
+           else if (uLayerBlend[i] == 2) res = mix(base, 1.0 - (1.0 - base) * (1.0 - col), a);
+           else { vec3 hard = base * col * 2.0; vec3 soft = 1.0 - 2.0 * (1.0 - base) * (1.0 - col);
+                  res = mix(base, mix(hard, soft, step(0.5, base)), a); }
+           diffuseColor.rgb = res;
+           gRough += a * uLayerRough[i];
+         }`)
+      .replace('#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+         roughnessFactor = clamp(roughnessFactor + gRough, 0.0, 1.0);`);
+  };
+  material.needsUpdate = true;
+}
+
+// boxGroup is the projection volume: a unit cube spanning -1..1 on each axis.
+const boxGroup = new THREE.Group();
+const boxWire = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2)), // 2 units => spans -1..1
+  new THREE.LineBasicMaterial({ color: 0x44ff88 })
+);
+boxGroup.add(boxWire);
+boxGroup.position.set(0, 0, 0);
+scene.add(boxGroup);
+
+const tc = new TransformControls(camera, renderer.domElement);
+tc.attach(boxGroup);
+tc.setMode('translate');
+tc.setSpace('local'); // local-space gizmo (aligns to the box's own axes)
+// TransformControls is an Object3D in older three, but exposes getHelper() in the
+// newer Controls-based refactor. Support both so the gizmo shows regardless of version.
+const tcHelper = (typeof tc.getHelper === 'function') ? tc.getHelper() : tc;
+scene.add(tcHelper);
+
+function setGizmoVisible(v) {
+  for (let k = 0; k < MAX_LAYERS; k++) layers[k].box.visible = false;
+  layers[activeLayer].box.visible = v;   // box (with its wire) shown only when gizmo on
+  tcHelper.visible = v;
+  tc.enabled = v; // an invisible gizmo must not be grabbable
+}
+
+// Orbit must not fight the gizmo.
+tc.addEventListener('dragging-changed', (e) => { orbit.enabled = !e.value; });
+
+function updateProjector() {
+  for (let i = 0; i < MAX_LAYERS; i++) {
+    layers[i].box.updateMatrixWorld(true);
+    layerUniforms.uLayerProjInv.value[i].copy(layers[i].box.matrixWorld).invert();
+  }
+}
+// ============================== LAYERS ==============================
+const BLEND_INDEX = { alpha: 0, multiply: 1, screen: 2, overlay: 3 };
+const MAX_LAYERS = 4;
+
+// 1x1 transparent dummy texture so unused sampler-array slots stay bound.
+const dummyTex = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+dummyTex.needsUpdate = true;
+
+const layerUniforms = {
+  uLayerEnabled:    { value: [0, 0, 0, 0] },
+  uLayerHasTex:     { value: [0, 0, 0, 0] },
+  uLayerTex:        { value: [dummyTex, dummyTex, dummyTex, dummyTex] },
+  uLayerProjInv:    { value: [new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4()] },
+  uLayerBlend:      { value: [0, 0, 0, 0] },
+  uLayerOpacity:    { value: [1, 1, 1, 1] },
+  uLayerRough:      { value: [0, 0, 0, 0] },
+  uLayerPersp:      { value: [0, 0, 0, 0] },
+  uLayerCull:       { value: [0, 0, 0, 0] },
+  uLayerBrightness: { value: [1, 1, 1, 1] },
+  uLayerContrast:   { value: [1, 1, 1, 1] },
+  uLayerSaturation: { value: [1, 1, 1, 1] },
+  uLayerTint:       { value: [new THREE.Vector3(1,1,1), new THREE.Vector3(1,1,1), new THREE.Vector3(1,1,1), new THREE.Vector3(1,1,1)] },
+};
+
+function makeLayerBox() {
+  const g = new THREE.Group();
+  const wire = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2)),
+    new THREE.LineBasicMaterial({ color: 0x44ff88 })
+  );
+  g.add(wire);
+  g.visible = false;
+  scene.add(g);
+  return { group: g, wire };
+}
+
+// Layer 0 reuses the existing boxGroup/boxWire; layers 1-3 are new hidden boxes.
+const layers = [];
+for (let i = 0; i < MAX_LAYERS; i++) {
+  const box = i === 0 ? { group: boxGroup, wire: boxWire } : makeLayerBox();
+  layers.push({
+    enabled: i === 0,
+    box: box.group, wire: box.wire,
+    tex: null, hasTex: false,
+    blend: 'alpha', opacity: 1.0, rough: 0.0, persp: 0.0, cull: false,
+    brightness: 1.0, contrast: 1.0, saturation: 1.0, tint: [1, 1, 1],
+  });
+}
+let activeLayer = 0;
+
+function syncLayerUniforms() {
+  for (let i = 0; i < MAX_LAYERS; i++) {
+    const L = layers[i];
+    layerUniforms.uLayerEnabled.value[i] = L.enabled ? 1 : 0;
+    layerUniforms.uLayerHasTex.value[i] = L.hasTex ? 1 : 0;
+    layerUniforms.uLayerTex.value[i] = L.tex || dummyTex;
+    layerUniforms.uLayerBlend.value[i] = BLEND_INDEX[L.blend];
+    layerUniforms.uLayerOpacity.value[i] = L.opacity;
+    layerUniforms.uLayerRough.value[i] = L.rough;
+    layerUniforms.uLayerPersp.value[i] = L.persp;
+    layerUniforms.uLayerCull.value[i] = L.cull ? 1 : 0;
+    layerUniforms.uLayerBrightness.value[i] = L.brightness;
+    layerUniforms.uLayerContrast.value[i] = L.contrast;
+    layerUniforms.uLayerSaturation.value[i] = L.saturation;
+    layerUniforms.uLayerTint.value[i].set(L.tint[0], L.tint[1], L.tint[2]);
+  }
+}
+
+function setActiveLayer(i) {
+  activeLayer = Math.max(0, Math.min(MAX_LAYERS - 1, i));
+  for (let k = 0; k < MAX_LAYERS; k++) layers[k].box.visible = false;
+  tc.attach(layers[activeLayer].box);
+  setGizmoVisible(params.showGizmo);
+  updateProjector();
+}
+
+function moveActiveLayer(delta) {
+  const j = activeLayer + delta;
+  if (j < 0 || j >= MAX_LAYERS) return;
+  const tmp = layers[activeLayer];
+  layers[activeLayer] = layers[j];
+  layers[j] = tmp;
+  activeLayer = j;
+  syncLayerUniforms();
+  setActiveLayer(activeLayer);
+  pullActiveLayer();
+}
+
+tc.addEventListener('change', updateProjector);
+tc.addEventListener('objectChange', updateProjector);
+syncLayerUniforms();
+updateProjector(); // initialize
+
+// ============================== OVERLAY ==============================
+function makeTestPatternTexture() {
+  const S = 512, cells = 8, cw = S / cells;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, S, S); // transparent base (alpha gaps so blend shows)
+  // checker of semi-opaque squares
+  for (let y = 0; y < cells; y++) {
+    for (let x = 0; x < cells; x++) {
+      if ((x + y) % 2 === 0) {
+        ctx.fillStyle = 'rgba(255,80,80,0.9)';
+        ctx.fillRect(x * cw, y * cw, cw, cw);
+      }
+    }
+  }
+  // center crosshair
+  ctx.strokeStyle = 'rgba(40,200,255,1)';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(S / 2, 40); ctx.lineTo(S / 2, S - 40);
+  ctx.moveTo(40, S / 2); ctx.lineTo(S - 40, S / 2);
+  ctx.stroke();
+  // border
+  ctx.strokeStyle = 'rgba(255,255,255,1)';
+  ctx.lineWidth = 12;
+  ctx.strokeRect(6, 6, S - 12, S - 12);
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function setOverlayTexture(tex) {
+  const L = layers[activeLayer];
+  if (L.tex && L.tex.dispose) L.tex.dispose();
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  L.tex = tex;
+  L.hasTex = true;
+  L.enabled = true;
+  syncLayerUniforms();
+}
+
+setOverlayTexture(makeTestPatternTexture());
+
+// ============================== ENVIRONMENT ==============================
+const envState = {
+  currentTarget: null,    // WebGLRenderTarget from pmrem (HDRI) to dispose on swap
+  currentEquirect: null,  // equirect texture, for optional background
+  intensity: 1.0,
+  showBackground: false,
+  bgBlur: 0.0,
+};
+const rgbeLoader = new RGBELoader();
+const exrLoader = new EXRLoader();
+
+function applyEnvIntensity() {
+  meshMaterials.forEach((m) => { m.envMapIntensity = envState.intensity; });
+  groundMat.envMapIntensity = envState.intensity; // harmless on ShadowMaterial
+}
+
+function applyBackground() {
+  if (envState.showBackground && envState.currentEquirect) {
+    scene.background = envState.currentEquirect;
+  } else {
+    scene.background = new THREE.Color(0x202327);
+  }
+  scene.backgroundBlurriness = envState.bgBlur;
+}
+
+function extractSunFromHDRI() {
+  const tex = envState.currentEquirect;
+  if (!tex || !tex.image || !tex.image.data) {
+    hud.textContent = 'Load an HDRI first to auto-aim the sun';
+    return;
+  }
+  const { data, width, height } = tex.image;
+  const isHalf = tex.type === THREE.HalfFloatType;
+  const ch = Math.round(data.length / (width * height)); // 3 or 4
+  const get = (i) => (isHalf ? THREE.DataUtils.fromHalfFloat(data[i]) : data[i]);
+  let best = -1, bu = 0.5, bv = 0.5, br = 1, bg = 1, bb = 1;
+  const stepX = Math.max(1, Math.floor(width / 256));
+  const stepY = Math.max(1, Math.floor(height / 128));
+  for (let y = 0; y < height; y += stepY) {
+    for (let x = 0; x < width; x += stepX) {
+      const idx = (y * width + x) * ch;
+      const r = get(idx), g = get(idx + 1), b = get(idx + 2);
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (lum > best) { best = lum; bu = (x + 0.5) / width; bv = (y + 0.5) / height; br = r; bg = g; bb = b; }
+    }
+  }
+  const phi = (bu - 0.5) * Math.PI * 2;
+  const theta = (bv - 0.5) * Math.PI;
+  const dirVec = new THREE.Vector3(
+    Math.cos(theta) * Math.cos(phi),
+    Math.sin(theta),
+    Math.cos(theta) * Math.sin(phi)
+  );
+  sunState.azimuthDeg = (THREE.MathUtils.radToDeg(Math.atan2(dirVec.z, dirVec.x)) + 360) % 360;
+  sunState.elevationDeg = Math.max(0, THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(dirVec.y, -1, 1))));
+  const maxc = Math.max(br, bg, bb, 1e-4);
+  sunState.color = [(br / maxc) * 255, (bg / maxc) * 255, (bb / maxc) * 255];
+  sunState.intensity = THREE.MathUtils.clamp(best, 0.5, 5);
+  applySun();
+  updateShadowOpacity();
+  if (typeof refreshSunGui === 'function') refreshSunGui();
+  hud.textContent = 'Sun aimed from HDRI';
+}
+
+function applyEnvFromEquirect(tex) {
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  const rt = pmrem.fromEquirectangular(tex);
+  if (envState.currentTarget) envState.currentTarget.dispose();
+  envState.currentTarget = rt;
+  scene.environment = rt.texture;
+  if (envState.currentEquirect && envState.currentEquirect !== tex) {
+    envState.currentEquirect.dispose();
+  }
+  envState.currentEquirect = tex;
+  applyEnvIntensity();
+  applyBackground();
+  if (sunState.auto) extractSunFromHDRI();
+}
+
+function loadHDRIFromURL(url, label) {
+  // Detect EXR from the filename label (file-input/drag pass a blob: URL with no
+  // extension) and fall back to the URL string (for direct URL loads).
+  const isExr = /\.exr(\?|$)/i.test(label || '') || /\.exr(\?|$)/i.test(url);
+  const ldr = isExr ? exrLoader : rgbeLoader;
+  const isBlob = /^blob:/i.test(url);
+  ldr.load(url, (tex) => {
+    applyEnvFromEquirect(tex);
+    hud.textContent = `HDRI: ${label || url}`;
+    if (isBlob) URL.revokeObjectURL(url); // free large HDR/EXR file memory
+  }, undefined, (err) => {
+    hud.textContent = 'HDRI load error (see console)';
+    console.error(err);
+    if (isBlob) URL.revokeObjectURL(url);
+  });
+}
+
+function resetToRoomEnvironment() {
+  if (envState.currentTarget) { envState.currentTarget.dispose(); envState.currentTarget = null; }
+  if (envState.currentEquirect) { envState.currentEquirect.dispose(); envState.currentEquirect = null; }
+  const rt = pmrem.fromScene(new RoomEnvironment(), 0.04);
+  envState.currentTarget = rt; // tracked so repeated resets don't leak render targets
+  scene.environment = rt.texture;
+  envState.showBackground = false;
+  if (typeof params !== 'undefined') {
+    params.showBackground = false;
+    gui.controllersRecursive().forEach((c) => c.updateDisplay()); // sync GUI checkbox
+  }
+  applyEnvIntensity();
+  applyBackground();
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================== CONTROLS ==============================
+const params = {
+  showGizmo: true,
+  captureScale: 1,
+  screenshot: () => takeScreenshot(),
+  gizmo: 'translate',
+  frameMesh: () => frameBoxOnMesh(),
+  exposure: 1.0,
+  contrast: 1.0,
+  saturation: 1.0,
+  temperature: 0.0,
+  tint: 0.0,
+  resetColor: () => {
+    params.exposure = 1.0; params.contrast = 1.0; params.saturation = 1.0;
+    params.temperature = 0.0; params.tint = 0.0;
+    renderer.toneMappingExposure = 1.0;
+    gradePass.uniforms.uContrast.value = 1.0;
+    gradePass.uniforms.uSaturation.value = 1.0;
+    gradePass.uniforms.uTemperature.value = 0.0;
+    gradePass.uniforms.uTint.value = 0.0;
+    colorFolder.controllers.forEach((c) => c.updateDisplay());
+  },
+  envIntensity: 1.0,
+  showBackground: false,
+  bgBlur: 0.0,
+  loadHDRI: () => hdriFileInput.click(),
+  hdriURL: '',
+  loadHDRIURL: () => { const u = params.hdriURL.trim(); if (u) loadHDRIFromURL(u, u); },
+  resetEnv: () => resetToRoomEnvironment(),
+  shadows: true,
+  shadowStrength: 0.3,
+  shadowSoftness: 12,
+  gtao: true,
+  aoRadius: 0.25,
+  smaa: true,
+};
+const gui = new GUI({ title: 'Overlay Projector' });
+gui.add(params, 'gizmo', ['translate', 'rotate', 'scale'])
+   .onChange((v) => tc.setMode(v));
+gui.add(params, 'frameMesh').name('Frame Mesh');
+gui.add(params, 'showGizmo').name('Show gizmo')
+   .onChange((v) => setGizmoVisible(v));
+gui.add(params, 'captureScale', { '1x': 1, '2x': 2, '4x': 4 }).name('Capture scale');
+gui.add(params, 'screenshot').name('Screenshot (P)');
+
+// ---- Active Layer panel ----
+const L = {
+  selector: 'Layer 1',
+  addLayer: () => {
+    const slot = layers.findIndex((l) => !l.enabled);
+    if (slot === -1) { hud.textContent = 'Max 4 layers'; return; }
+    layers[slot].enabled = true;
+    syncLayerUniforms();
+    setActiveLayer(slot);
+    pullActiveLayer();
+  },
+  removeLayer: () => {
+    if (activeLayer === 0) { hud.textContent = 'Layer 1 cannot be removed'; return; }
+    const a = layers[activeLayer];
+    a.enabled = false;
+    if (a.tex && a.tex.dispose) a.tex.dispose(); // free the GPU texture
+    a.tex = null;
+    a.hasTex = false;
+    syncLayerUniforms();
+    setActiveLayer(0);
+    pullActiveLayer();
+  },
+  enabled: true, blend: 'alpha', opacity: 1.0, perspective: 0.0, cull: false,
+  roughness: 0.0, brightness: 1.0, contrast: 1.0, saturation: 1.0, tint: [255, 255, 255],
+  loadImage: () => layerFileInput.click(),
+  resetToPattern: () => { setOverlayTexture(makeTestPatternTexture()); pullActiveLayer(); },
+};
+
+// Hidden file input for per-layer "Load image".
+const layerFileInput = document.createElement('input');
+layerFileInput.type = 'file';
+layerFileInput.accept = 'image/*';
+layerFileInput.style.display = 'none';
+document.body.appendChild(layerFileInput);
+layerFileInput.addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  texLoader.load(url, (tex) => {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    setOverlayTexture(tex);
+    pullActiveLayer();
+    URL.revokeObjectURL(url);
+    hud.textContent = `layer ${activeLayer + 1}: ${file.name}`;
+  }, undefined, (err) => { console.error(err); URL.revokeObjectURL(url); });
+});
+
+const layerFolder = gui.addFolder('Layers');
+layerFolder.add(L, 'selector', ['Layer 1', 'Layer 2', 'Layer 3', 'Layer 4']).name('Active')
+  .onChange((v) => { setActiveLayer(parseInt(v.split(' ')[1], 10) - 1); pullActiveLayer(); });
+layerFolder.add(L, 'addLayer').name('Add layer');
+layerFolder.add(L, 'removeLayer').name('Remove layer');
+layerFolder.add({ up: () => moveActiveLayer(-1) }, 'up').name('Move up');
+layerFolder.add({ down: () => moveActiveLayer(1) }, 'down').name('Move down');
+layerFolder.add(L, 'enabled').onChange((v) => { layers[activeLayer].enabled = v; syncLayerUniforms(); });
+layerFolder.add(L, 'blend', Object.keys(BLEND_INDEX)).onChange((v) => { layers[activeLayer].blend = v; syncLayerUniforms(); });
+layerFolder.add(L, 'opacity', 0, 1, 0.01).onChange((v) => { layers[activeLayer].opacity = v; syncLayerUniforms(); });
+layerFolder.add(L, 'perspective', 0, 1, 0.01).onChange((v) => { layers[activeLayer].persp = v; syncLayerUniforms(); });
+layerFolder.add(L, 'cull').onChange((v) => { layers[activeLayer].cull = v; syncLayerUniforms(); });
+layerFolder.add(L, 'roughness', 0, 1, 0.01).onChange((v) => { layers[activeLayer].rough = v; syncLayerUniforms(); });
+layerFolder.add(L, 'brightness', 0, 2, 0.01).onChange((v) => { layers[activeLayer].brightness = v; syncLayerUniforms(); });
+layerFolder.add(L, 'contrast', 0, 2, 0.01).onChange((v) => { layers[activeLayer].contrast = v; syncLayerUniforms(); });
+layerFolder.add(L, 'saturation', 0, 2, 0.01).onChange((v) => { layers[activeLayer].saturation = v; syncLayerUniforms(); });
+layerFolder.addColor(L, 'tint', 255).onChange((v) => { layers[activeLayer].tint = [v[0]/255, v[1]/255, v[2]/255]; syncLayerUniforms(); });
+layerFolder.add(L, 'loadImage').name('Load image');
+layerFolder.add(L, 'resetToPattern').name('Reset to test pattern');
+
+function pullActiveLayer() {
+  const a = layers[activeLayer];
+  L.selector = `Layer ${activeLayer + 1}`;
+  L.enabled = a.enabled; L.blend = a.blend; L.opacity = a.opacity;
+  L.perspective = a.persp; L.cull = a.cull; L.roughness = a.rough;
+  L.brightness = a.brightness; L.contrast = a.contrast; L.saturation = a.saturation;
+  L.tint = [a.tint[0] * 255, a.tint[1] * 255, a.tint[2] * 255];
+  layerFolder.controllersRecursive().forEach((c) => c.updateDisplay());
+}
+
+setActiveLayer(0);
+pullActiveLayer();
+
+const colorFolder = gui.addFolder('Color');
+colorFolder.add(params, 'exposure', 0.2, 3, 0.01)
+  .onChange((v) => { renderer.toneMappingExposure = v; });
+colorFolder.add(params, 'contrast', 0, 2, 0.01)
+  .onChange((v) => { gradePass.uniforms.uContrast.value = v; });
+colorFolder.add(params, 'saturation', 0, 2, 0.01)
+  .onChange((v) => { gradePass.uniforms.uSaturation.value = v; });
+colorFolder.add(params, 'temperature', -1, 1, 0.01)
+  .onChange((v) => { gradePass.uniforms.uTemperature.value = v; });
+colorFolder.add(params, 'tint', -1, 1, 0.01)
+  .onChange((v) => { gradePass.uniforms.uTint.value = v; });
+colorFolder.add(params, 'resetColor').name('Reset color');
+
+// Hidden file input for "Load HDRI".
+const hdriFileInput = document.createElement('input');
+hdriFileInput.type = 'file';
+hdriFileInput.accept = '.hdr,.exr';
+hdriFileInput.style.display = 'none';
+document.body.appendChild(hdriFileInput);
+hdriFileInput.addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  loadHDRIFromURL(url, file.name);
+});
+
+const envFolder = gui.addFolder('Environment');
+envFolder.add(params, 'envIntensity', 0, 3, 0.01).name('Env intensity')
+  .onChange((v) => { envState.intensity = v; applyEnvIntensity(); });
+envFolder.add(params, 'showBackground').name('Show as background')
+  .onChange((v) => { envState.showBackground = v; applyBackground(); });
+envFolder.add(params, 'bgBlur', 0, 1, 0.01).name('Background blur')
+  .onChange((v) => { envState.bgBlur = v; applyBackground(); });
+envFolder.add(params, 'loadHDRI').name('Load HDRI (.hdr/.exr)');
+envFolder.add(params, 'hdriURL').name('HDRI URL');
+envFolder.add(params, 'loadHDRIURL').name('Load URL');
+envFolder.add(params, 'resetEnv').name('Reset environment');
+
+const renderFolder = gui.addFolder('Render');
+renderFolder.add(params, 'gtao').name('GTAO (AO)')
+  .onChange((v) => { gtaoPass.enabled = v; });
+renderFolder.add(params, 'aoRadius', 0.05, 1, 0.01).name('AO radius')
+  .onChange((v) => { gtaoPass.updateGtaoMaterial({ radius: v }); });
+renderFolder.add(params, 'smaa').name('SMAA (AA)')
+  .onChange((v) => { smaaPass.enabled = v; });
+
+const sunFolder = gui.addFolder('Sun');
+sunFolder.add(sunState, 'azimuthDeg', 0, 360, 1).name('Azimuth').onChange(applySun);
+sunFolder.add(sunState, 'elevationDeg', 0, 90, 1).name('Elevation').onChange(applySun);
+sunFolder.add(sunState, 'intensity', 0, 5, 0.05).name('Intensity').onChange(() => { applySun(); updateShadowOpacity(); });
+sunFolder.addColor(sunState, 'color', 255).name('Color').onChange(applySun);
+sunFolder.add(sunState, 'auto').name('Auto from HDRI');
+sunFolder.add({ reextract: () => extractSunFromHDRI() }, 'reextract').name('Re-extract from HDRI');
+function refreshSunGui() { sunFolder.controllersRecursive().forEach((c) => c.updateDisplay()); }
+
+const shadowFolder = gui.addFolder('Shadows');
+shadowFolder.add(params, 'shadows')
+  .onChange((v) => {
+    renderer.shadowMap.enabled = v;
+    dir.castShadow = v;
+    ground.visible = v;
+    meshMaterials.forEach((m) => { m.needsUpdate = true; });
+  });
+shadowFolder.add(params, 'shadowStrength', 0, 1, 0.01).name('Shadow strength')
+  .onChange((v) => { shadowStrengthBase = v; updateShadowOpacity(); });
+shadowFolder.add(params, 'shadowSoftness', 0, 40, 1).name('Shadow softness')
+  .onChange((v) => { dir.shadow.radius = v; });
+
+function frameBoxOnMesh() {
+  if (!wallRoot) return;
+  const box = new THREE.Box3().setFromObject(wallRoot);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const b = layers[activeLayer].box;
+  b.position.copy(center);
+  b.rotation.set(0, 0, 0);
+  // box geometry spans -1..1 (size 2) -> half-extent scale fits the mesh bbox
+  b.scale.set(Math.max(size.x, 1e-3) / 2,
+              Math.max(size.y, 1e-3) / 2,
+              Math.max(size.z, 1e-3) / 2);
+  updateProjector();
+}
+
+function download(blob, name) {
+  if (!blob) { hud.textContent = 'Screenshot failed (see console)'; return; }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function takeScreenshot() {
+  const scale = params.captureScale || 1;
+  const size = renderer.getSize(new THREE.Vector2());
+  const w = size.x, h = size.y;
+  const prevGizmo = params.showGizmo;
+
+  setGizmoVisible(false); // clean shot regardless of toggle state
+  renderer.setSize(w * scale, h * scale, false);
+  composer.setSize(w * scale, h * scale);
+  composer.render();
+
+  renderer.domElement.toBlob((blob) => {
+    download(blob, 'wall-projector.png');
+    renderer.setSize(w, h, false);
+    composer.setSize(w, h);
+    setGizmoVisible(prevGizmo);
+    composer.render();
+    hud.textContent = `screenshot saved (${scale}x)`;
+  }, 'image/png');
+}
+
+const axisShown = { x: true, y: true, z: true };
+window.addEventListener('keydown', (e) => {
+  switch (e.key.toLowerCase()) {
+    case 'w': params.gizmo = 'translate'; tc.setMode('translate'); gui.controllers.forEach(c=>c.updateDisplay()); break;
+    case 'e': params.gizmo = 'rotate';    tc.setMode('rotate');    gui.controllers.forEach(c=>c.updateDisplay()); break;
+    case 'r': params.gizmo = 'scale';     tc.setMode('scale');     gui.controllers.forEach(c=>c.updateDisplay()); break;
+    case 'x': axisShown.x = !axisShown.x; tc.showX = axisShown.x; break;
+    case 'y': axisShown.y = !axisShown.y; tc.showY = axisShown.y; break;
+    case 'z': axisShown.z = !axisShown.z; tc.showZ = axisShown.z; break;
+    case 'h': params.showGizmo = !params.showGizmo; setGizmoVisible(params.showGizmo); gui.controllersRecursive().forEach(c=>c.updateDisplay()); break;
+    case 'p': takeScreenshot(); break;
+    case '+': case '=': tc.setSize(tc.size + 0.2); break;
+    case '-': case '_': tc.setSize(Math.max(0.2, tc.size - 0.2)); break;
+  }
+});
+
+const texLoader = new THREE.TextureLoader();
+window.addEventListener('dragover', (e) => { e.preventDefault(); });
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!file) return;
+  // HDRI by extension (drag-dropped .hdr/.exr have empty/oct-stream MIME).
+  if (/\.(hdr|exr)$/i.test(file.name)) {
+    const hurl = URL.createObjectURL(file);
+    loadHDRIFromURL(hurl, file.name);
+    return;
+  }
+  if (!file.type.startsWith('image/')) return;
+  const url = URL.createObjectURL(file);
+  texLoader.load(url, (tex) => {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    setOverlayTexture(tex);
+    pullActiveLayer();
+    URL.revokeObjectURL(url);
+    hud.textContent = `overlay: ${file.name}`;
+  }, undefined, (err) => { console.error(err); URL.revokeObjectURL(url); });
+});
+
+// ============================== RENDER PIPELINE (grade) ==============================
+const GradeShader = {
+  uniforms: {
+    tDiffuse:    { value: null },
+    uContrast:   { value: 1.0 },
+    uSaturation: { value: 1.0 },
+    uTemperature:{ value: 0.0 },
+    uTint:       { value: 0.0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uContrast;
+    uniform float uSaturation;
+    uniform float uTemperature;
+    uniform float uTint;
+    varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      c.rgb += vec3(uTemperature, uTint * 0.5, -uTemperature) * 0.1;
+      c.rgb = (c.rgb - 0.5) * uContrast + 0.5;
+      float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+      c.rgb = mix(vec3(lum), c.rgb, uSaturation);
+      gl_FragColor = vec4(max(c.rgb, 0.0), c.a);
+    }
+  `,
+};
+
+const composerTarget = new THREE.WebGLRenderTarget(
+  window.innerWidth, window.innerHeight,
+  { samples: 4, type: THREE.HalfFloatType }
+);
+const composer = new EffectComposer(renderer, composerTarget);
+composer.addPass(new RenderPass(scene, camera));
+
+// GTAO — ambient occlusion.
+const gtaoPass = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+gtaoPass.output = GTAOPass.OUTPUT.Default;
+gtaoPass.updateGtaoMaterial({ radius: 0.25 });
+gtaoPass.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, samples: 16 });
+gtaoPass.enabled = true;
+composer.addPass(gtaoPass);
+
+const gradePass = new ShaderPass(GradeShader);
+composer.addPass(gradePass);
+
+// SMAA — final anti-aliasing.
+const smaaPass = new SMAAPass(
+  window.innerWidth * renderer.getPixelRatio(),
+  window.innerHeight * renderer.getPixelRatio()
+);
+smaaPass.enabled = true;
+composer.addPass(smaaPass);
+
+composer.addPass(new OutputPass()); // applies AgX tone mapping + exposure + sRGB
+
+function animate() {
+  requestAnimationFrame(animate);
+  orbit.update();
+  composer.render();
+}
+animate();
+hud.textContent =
+  'W/E/R move·rotate·scale   X/Y/Z toggle axis   +/- gizmo size\n' +
+  'drag empty space: orbit   drop an image: load overlay';
+</script>
+</body>
+</html>

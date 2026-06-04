@@ -1,0 +1,14 @@
+# Editor / tooling config
+.claude/
+
+# Internal planning + dev notes (not for the public site)
+docs/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
