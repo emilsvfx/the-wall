@@ -2,7 +2,7 @@
 
 An interactive **3D wall viewer** built with [Three.js](https://threejs.org/). Project images and layered artwork onto a 3D wall model (`wall.glb`) with real-time lighting, soft shadows, HDRI environments, and image-based ambient occlusion — then export a high-resolution screenshot.
 
-> **Live demo:** _deploy on Vercel and drop your URL here_ → `https://the-wall.vercel.app`
+> **▶ Live demo: [the-wall-gray.vercel.app](https://the-wall-gray.vercel.app/)**
 
 ![Three.js](https://img.shields.io/badge/Three.js-r160-000?logo=three.js) ![No build step](https://img.shields.io/badge/build-none-brightgreen) ![Static site](https://img.shields.io/badge/deploy-static-blue)
 
