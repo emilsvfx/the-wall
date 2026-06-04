@@ -3,6 +3,10 @@
 
 # Internal planning + dev notes (not for the public site)
 docs/
+overlay-projector-reference.md
+
+# Unused assets (not loaded by the app)
+Images/
 
 # OS junk
 Thumbs.db
